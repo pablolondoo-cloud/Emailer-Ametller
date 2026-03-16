@@ -1,7 +1,7 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
-Hace login con Playwright e intercepta la RESPUESTA de la llamada que
-el propio portal hace a /nebula/routing al cargar la página de rutas.
+Login con Playwright, navega a la URL exacta de rutas con store_id correcto
+e intercepta la respuesta de /nebula/routing.
 """
 
 import os
@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from playwright.async_api import async_playwright, Route
+from playwright.async_api import async_playwright
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -27,12 +27,12 @@ API_BASE   = "https://avt-backend.instaleap.io/nebula/routing"
 
 
 # ─────────────────────────────────────────────
-# 1. LOGIN + INTERCEPTAR RESPUESTA DE LA API
+# 1. LOGIN + INTERCEPTAR RESPUESTA
 # ─────────────────────────────────────────────
 async def fetch_routes_from_browser() -> list:
     print("🔐 Iniciando login con Playwright...")
-    all_routes   = []
-    captured     = asyncio.Event()
+    all_routes = []
+    response_event = asyncio.Event()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -41,17 +41,20 @@ async def fetch_routes_from_browser() -> list:
         )
         page = await context.new_page()
 
-        # ── Interceptar la RESPUESTA de /nebula/routing ──
+        # ── Interceptar TODAS las respuestas de /nebula/routing ──
         async def handle_response(response):
             if "nebula/routing" in response.url and response.status == 200:
                 try:
                     data   = await response.json()
                     routes = data.get("routes", [])
-                    all_routes.extend(routes)
-                    print(f"✅ Interceptada respuesta: {len(routes)} rutas (total_pages={data.get('total_pages',1)})")
-                    captured.set()
+                    if routes:  # Solo guardar si tiene rutas reales
+                        all_routes.extend(routes)
+                        print(f"✅ Interceptada: {len(routes)} rutas de {response.url[:80]}")
+                        response_event.set()
+                    else:
+                        print(f"ℹ️  Respuesta vacía interceptada (store diferente), ignorando...")
                 except Exception as e:
-                    print(f"⚠️  Error parseando respuesta: {e}")
+                    print(f"⚠️  Error parseando: {e}")
 
         page.on("response", handle_response)
 
@@ -65,43 +68,45 @@ async def fetch_routes_from_browser() -> list:
         await page.fill('#email', PORTAL_EMAIL)
         print("✉️  Email introducido")
         await page.click('button:has-text("Continue")')
-        print("▶️  Continue pulsado")
 
         # ── Password ──
         await page.wait_for_selector('input[type="password"]', timeout=15000)
         await page.fill('input[type="password"]', PORTAL_PASSWORD)
         print("🔑 Contraseña introducida")
         await page.click('button[type="submit"], button:has-text("Log in"), button:has-text("Continue"), button:has-text("Sign in")')
-        print("▶️  Submit pulsado")
 
         # ── Esperar dashboard ──
         await page.wait_for_url("**/routes**", timeout=30000)
-        print("✅ Login exitoso, dashboard cargado")
-        await page.wait_for_timeout(4000)
+        print("✅ Login exitoso")
+        await page.wait_for_timeout(3000)
 
-        # ── Si no se capturó aún, navegar a la URL de rutas del día ──
-        if not captured.is_set():
-            print("🔄 Navegando a rutas para forzar llamada a la API...")
-            madrid     = timezone(timedelta(hours=1))
-            today      = datetime.now(madrid).date()
-            routes_url = (
-                f"{PORTAL_URL}/routes"
-                f"?storeId={STORE_ID}"
-                f"&date={today}"
-                f"&status=CREATED,ON_BOARDING,PROCESSING"
-            )
-            await page.goto(routes_url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(5000)
+        # ── Navegar a la URL exacta con el store_id y fecha correctos ──
+        madrid     = timezone(timedelta(hours=1))
+        today      = datetime.now(madrid).date()
+        today_str  = today.strftime("%Y-%m-%d")
 
-        # ── Esperar captura (máximo 15s) ──
+        target_url = (
+            f"{PORTAL_URL}/routes"
+            f"?storeId={STORE_ID}"
+            f"&date={today_str}"
+            f"&status=CREATED,ON_BOARDING,PROCESSING"
+        )
+        print(f"🔄 Navegando a: {target_url}")
+        await page.goto(target_url, wait_until="networkidle", timeout=30000)
+        print("📄 Página de rutas cargada")
+
+        # ── Esperar la respuesta interceptada (máx 20s) ──
         try:
-            await asyncio.wait_for(captured.wait(), timeout=15)
+            await asyncio.wait_for(response_event.wait(), timeout=20)
+            print(f"✅ Rutas capturadas correctamente")
         except asyncio.TimeoutError:
-            print("⚠️  Timeout esperando respuesta de la API")
+            # Si no llegó respuesta, esperar más y reintentar scroll
+            print("⏳ Esperando más tiempo...")
+            await page.wait_for_timeout(5000)
 
         await browser.close()
 
-    print(f"✅ Total rutas capturadas: {len(all_routes)}")
+    print(f"✅ Total rutas: {len(all_routes)}")
     return all_routes
 
 
