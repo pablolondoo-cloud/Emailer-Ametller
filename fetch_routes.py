@@ -1,7 +1,7 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
-Hace login con Playwright y ejecuta la llamada a la API DESDE el propio
-navegador (via page.evaluate) para evitar problemas de autenticación.
+Hace login con Playwright e intercepta la RESPUESTA de la llamada que
+el propio portal hace a /nebula/routing al cargar la página de rutas.
 """
 
 import os
@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Route
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -27,10 +27,12 @@ API_BASE   = "https://avt-backend.instaleap.io/nebula/routing"
 
 
 # ─────────────────────────────────────────────
-# 1. LOGIN + LLAMAR API DESDE EL NAVEGADOR
+# 1. LOGIN + INTERCEPTAR RESPUESTA DE LA API
 # ─────────────────────────────────────────────
 async def fetch_routes_from_browser() -> list:
     print("🔐 Iniciando login con Playwright...")
+    all_routes   = []
+    captured     = asyncio.Event()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -39,7 +41,21 @@ async def fetch_routes_from_browser() -> list:
         )
         page = await context.new_page()
 
-        # Cargar portal
+        # ── Interceptar la RESPUESTA de /nebula/routing ──
+        async def handle_response(response):
+            if "nebula/routing" in response.url and response.status == 200:
+                try:
+                    data   = await response.json()
+                    routes = data.get("routes", [])
+                    all_routes.extend(routes)
+                    print(f"✅ Interceptada respuesta: {len(routes)} rutas (total_pages={data.get('total_pages',1)})")
+                    captured.set()
+                except Exception as e:
+                    print(f"⚠️  Error parseando respuesta: {e}")
+
+        page.on("response", handle_response)
+
+        # ── Cargar portal ──
         await page.goto(PORTAL_URL, wait_until="networkidle", timeout=30000)
         print("📄 Portal cargado")
         await page.wait_for_timeout(2000)
@@ -60,86 +76,33 @@ async def fetch_routes_from_browser() -> list:
 
         # ── Esperar dashboard ──
         await page.wait_for_url("**/routes**", timeout=30000)
-        print("✅ Login exitoso")
+        print("✅ Login exitoso, dashboard cargado")
         await page.wait_for_timeout(4000)
 
-        # ── Construir URL de la API para hoy ──
-        madrid   = timezone(timedelta(hours=1))
-        today    = datetime.now(madrid).date()
-        from_dt  = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=madrid)
-        to_dt    = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=madrid)
-        from_str = from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        to_str   = to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.999Z")
+        # ── Si no se capturó aún, navegar a la URL de rutas del día ──
+        if not captured.is_set():
+            print("🔄 Navegando a rutas para forzar llamada a la API...")
+            madrid     = timezone(timedelta(hours=1))
+            today      = datetime.now(madrid).date()
+            routes_url = (
+                f"{PORTAL_URL}/routes"
+                f"?storeId={STORE_ID}"
+                f"&date={today}"
+                f"&status=CREATED,ON_BOARDING,PROCESSING"
+            )
+            await page.goto(routes_url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(5000)
 
-        states_qs = "&".join([f"states[]={s}" for s in STATES])
-        api_url = (
-            f"{API_BASE}"
-            f"?store_id={STORE_ID}"
-            f"&client_id={CLIENT_ID}"
-            f"&limit=100"
-            f"&offset=0"
-            f"&from={from_str}"
-            f"&to={to_str}"
-            f"&{states_qs}"
-        )
-
-        print(f"📡 Llamando API desde el navegador...")
-        print(f"   URL: {api_url[:100]}...")
-
-        # ── Ejecutar fetch() DESDE el navegador (mismas cookies/auth) ──
-        result = await page.evaluate(f"""
-            async () => {{
-                const response = await fetch("{api_url}", {{
-                    method: "GET",
-                    headers: {{
-                        "accept": "application/json",
-                        "content-type": "application/json"
-                    }},
-                    credentials: "include"
-                }});
-                const status = response.status;
-                const text = await response.text();
-                return {{ status, text }};
-            }}
-        """)
-
-        print(f"   Status: {result['status']}")
-
-        if result['status'] != 200:
-            print(f"   Response: {result['text'][:300]}")
-            raise Exception(f"API devolvió {result['status']}: {result['text'][:200]}")
-
-        data = json.loads(result['text'])
-        routes = data.get("routes", [])
-        total_pages = data.get("total_pages", 1)
-        print(f"✅ Página 1: {len(routes)} rutas (total_pages={total_pages})")
-
-        # Paginar si hay más páginas
-        all_routes = list(routes)
-        for page_num in range(1, total_pages):
-            offset = page_num * 100
-            api_url_page = api_url.replace("offset=0", f"offset={offset}")
-            result = await page.evaluate(f"""
-                async () => {{
-                    const response = await fetch("{api_url_page}", {{
-                        method: "GET",
-                        headers: {{
-                            "accept": "application/json",
-                            "content-type": "application/json"
-                        }},
-                        credentials: "include"
-                    }});
-                    return {{ status: response.status, text: await response.text() }};
-                }}
-            """)
-            if result['status'] == 200:
-                page_data = json.loads(result['text'])
-                all_routes.extend(page_data.get("routes", []))
-                print(f"✅ Página {page_num+1}: {len(page_data.get('routes',[]))} rutas")
+        # ── Esperar captura (máximo 15s) ──
+        try:
+            await asyncio.wait_for(captured.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            print("⚠️  Timeout esperando respuesta de la API")
 
         await browser.close()
-        print(f"✅ Total rutas obtenidas: {len(all_routes)}")
-        return all_routes
+
+    print(f"✅ Total rutas capturadas: {len(all_routes)}")
+    return all_routes
 
 
 # ─────────────────────────────────────────────
@@ -163,10 +126,10 @@ def generate_excel(routes: list, output_path: str):
     fill_light   = PatternFill("solid", start_color="EBF0FA", end_color="EBF0FA")
     fill_white   = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
 
-    headers    = ["Route Number", "Job Number", "Stop", "Delivery From", "Delivery To"]
-    col_widths = [28, 28, 8, 22, 22]
+    col_headers = ["Route Number", "Job Number", "Stop", "Delivery From", "Delivery To"]
+    col_widths  = [28, 28, 8, 22, 22]
 
-    for col, (h, w) in enumerate(zip(headers, col_widths), 1):
+    for col, (h, w) in enumerate(zip(col_headers, col_widths), 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.font      = header_font
         cell.fill      = header_fill
