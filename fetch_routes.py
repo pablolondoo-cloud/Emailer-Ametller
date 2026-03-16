@@ -1,6 +1,7 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
-Usa Playwright para hacer login via Stytch y luego llama la API con las cookies de sesión.
+Usa Playwright para hacer login y luego intercepta la llamada real a la API
+para capturar los headers exactos que usa el navegador.
 """
 
 import os
@@ -27,10 +28,12 @@ API_BASE   = "https://avt-backend.instaleap.io/nebula/routing"
 
 
 # ─────────────────────────────────────────────
-# 1. LOGIN con Playwright → obtener cookies
+# 1. LOGIN + CAPTURAR HEADERS REALES de la API
 # ─────────────────────────────────────────────
-async def get_session_cookies() -> list:
+async def get_auth_headers() -> dict:
     print("🔐 Iniciando login con Playwright...")
+    captured_headers = {}
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -38,67 +41,97 @@ async def get_session_cookies() -> list:
         )
         page = await context.new_page()
 
+        # Interceptar requests a avt-backend para capturar los headers
+        async def intercept_request(request):
+            if "avt-backend.instaleap.io" in request.url and not captured_headers:
+                hdrs = request.headers
+                # Guardar todos los headers relevantes
+                for key in ["authorization", "cookie", "x-session-token", "x-auth-token", "x-token"]:
+                    if key in hdrs:
+                        captured_headers[key] = hdrs[key]
+                        print(f"✅ Header capturado: {key} = {hdrs[key][:60]}...")
+                # Guardar también headers genéricos útiles
+                captured_headers["_all"] = dict(hdrs)
+                print(f"📋 Todos los headers de avt-backend capturados ({len(hdrs)} headers)")
+
+        page.on("request", intercept_request)
+
         # Ir al portal
         await page.goto(PORTAL_URL, wait_until="networkidle", timeout=30000)
         print("📄 Portal cargado")
 
-        # Esperar el campo de email
-        await page.wait_for_selector('input[type="email"], input[name="email"], input[placeholder*="mail"]', timeout=15000)
-        await page.fill('input[type="email"], input[name="email"], input[placeholder*="mail"]', PORTAL_EMAIL)
+        # Esperar campo email
+        await page.wait_for_selector('input[type="email"], input[name="email"]', timeout=15000)
+        await page.fill('input[type="email"], input[name="email"]', PORTAL_EMAIL)
         print("✉️  Email introducido")
-
-        # Click continuar / siguiente
         await page.keyboard.press("Enter")
 
-        # Esperar campo de contraseña
+        # Esperar campo password
         await page.wait_for_selector('input[type="password"]', timeout=15000)
         await page.fill('input[type="password"]', PORTAL_PASSWORD)
         print("🔑 Contraseña introducida")
-
-        # Submit
         await page.keyboard.press("Enter")
 
-        # Esperar a que cargue el dashboard (URL cambia a /routes o similar)
+        # Esperar dashboard
         await page.wait_for_url("**/routes**", timeout=30000)
-        print("✅ Login exitoso, dashboard cargado")
+        print("✅ Login exitoso")
 
-        # Capturar cookies de sesión
-        cookies = await context.cookies()
+        # Esperar a que se haga la llamada a nebula/routing automáticamente
+        # (el dashboard la hace al cargar)
+        await page.wait_for_timeout(5000)
+
+        # Si no se capturó todavía, navegar a la URL de rutas para forzar la llamada
+        if not captured_headers:
+            print("🔄 Navegando a rutas para forzar llamada a la API...")
+            madrid = timezone(timedelta(hours=1))
+            today  = datetime.now(madrid).date()
+            routes_url = (
+                f"{PORTAL_URL}/routes"
+                f"?storeId={STORE_ID}"
+                f"&date={today}"
+                f"&status=CREATED,ON_BOARDING,PROCESSING"
+            )
+            await page.goto(routes_url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(5000)
+
         await browser.close()
 
-        print(f"🍪 Cookies capturadas: {len(cookies)}")
-        return cookies
+    if not captured_headers:
+        raise Exception("❌ No se pudieron capturar los headers de autenticación")
+
+    return captured_headers
 
 
 # ─────────────────────────────────────────────
-# 2. LLAMADA A LA API con las cookies
+# 2. LLAMADA A LA API con los headers capturados
 # ─────────────────────────────────────────────
-def get_routes(cookies: list) -> list:
-    # Convertir cookies de Playwright a dict para requests
-    cookie_dict = {c["name"]: c["value"] for c in cookies}
-
-    # Rango del día en hora Madrid (UTC+1)
-    madrid = timezone(timedelta(hours=1))
-    today  = datetime.now(madrid).date()
-    from_dt = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=madrid)
-    to_dt   = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=madrid)
+def get_routes(auth_headers: dict) -> list:
+    madrid   = timezone(timedelta(hours=1))
+    today    = datetime.now(madrid).date()
+    from_dt  = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=madrid)
+    to_dt    = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=madrid)
     from_str = from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     to_str   = to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.999Z")
 
-    headers = {
+    # Usar los headers reales capturados del navegador
+    headers = auth_headers.get("_all", {})
+    # Asegurar headers mínimos necesarios
+    headers.update({
         "accept":       "application/json",
         "content-type": "application/json",
         "origin":       "https://control.instaleap.io",
         "referer":      "https://control.instaleap.io/",
-        "user-agent":   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-    }
+    })
+    # Eliminar headers que pueden causar problemas en requests
+    for h in [":authority", ":method", ":path", ":scheme",
+              "content-length", "if-none-match"]:
+        headers.pop(h, None)
 
     all_routes = []
     limit  = 50
     offset = 0
 
     while True:
-        # Construir params manualmente para múltiples states[]
         params = (
             f"store_id={STORE_ID}"
             f"&client_id={CLIENT_ID}"
@@ -113,7 +146,13 @@ def get_routes(cookies: list) -> list:
         url = f"{API_BASE}?{params}"
         print(f"📡 Obteniendo rutas offset={offset}...")
 
-        r = requests.get(url, headers=headers, cookies=cookie_dict, timeout=30)
+        r = requests.get(url, headers=headers, timeout=30)
+
+        if r.status_code == 401:
+            print(f"❌ 401 Unauthorized. Headers enviados: {list(headers.keys())}")
+            print(f"   Response: {r.text[:300]}")
+            raise Exception("Autenticación fallida - 401")
+
         r.raise_for_status()
         data = r.json()
 
@@ -201,8 +240,8 @@ async def main():
     today_str = datetime.now(madrid).strftime("%Y-%m-%d")
     output    = f"rutas_{today_str}.xlsx"
 
-    cookies = await get_session_cookies()
-    routes  = get_routes(cookies)
+    auth_headers = await get_auth_headers()
+    routes       = get_routes(auth_headers)
 
     if not routes:
         print("⚠️  No hay rutas para hoy. No se genera Excel.")
