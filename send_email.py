@@ -1,5 +1,5 @@
 """
-send_email.py — Envía el Excel generado por fetch_routes.py por Gmail
+send_email.py — Envía los 4 Excel (2 tiendas x 2 días) por Gmail
 """
 
 import os
@@ -11,35 +11,54 @@ from email.mime.text import MIMEText
 from email import encoders
 from datetime import datetime, timezone, timedelta
 
-GMAIL_USER     = os.environ["GMAIL_USER"]       # tu_cuenta@gmail.com
-GMAIL_APP_PASS = os.environ["GMAIL_APP_PASS"]   # App Password de 16 caracteres
-EMAIL_TO_RAW   = os.environ["EMAIL_TO"]         # "a@x.com,b@x.com,c@x.com"
+GMAIL_USER     = os.environ["GMAIL_USER"]
+GMAIL_APP_PASS = os.environ["GMAIL_APP_PASS"]
+EMAIL_TO_RAW   = os.environ["EMAIL_TO"]
 
 recipients = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
 
-today_str = datetime.now(timezone(timedelta(hours=1))).strftime("%d/%m/%Y")
-today_file = datetime.now(timezone(timedelta(hours=1))).strftime("%Y-%m-%d")
+madrid   = timezone(timedelta(hours=1))
+today    = datetime.now(madrid).date()
+tomorrow = today + timedelta(days=1)
 
-# Busca el Excel generado por fetch_routes.py
-files = glob.glob(f"rutas_{today_file}.xlsx")
-if not files:
-    print("⚠️  No se encontró ningún Excel para adjuntar. Abortando envío.")
+STORES = ["ElPrat", "Garraf"]
+
+# ── Buscar todos los Excel generados ─────────────────────────
+files_to_attach = []
+summary_lines   = []
+
+for store in STORES:
+    for date_obj, label in [(today, "HOY"), (tomorrow, "MAÑANA")]:
+        filename = f"rutas_{store}_{date_obj.strftime('%Y-%m-%d')}.xlsx"
+        if os.path.exists(filename):
+            files_to_attach.append(filename)
+            summary_lines.append(
+                f"  📎 [{store}] {label} ({date_obj.strftime('%d/%m/%Y')}): {filename}"
+            )
+            print(f"📎 Adjuntando: {filename}")
+        else:
+            summary_lines.append(
+                f"  ⚠️  [{store}] {label} ({date_obj.strftime('%d/%m/%Y')}): sin rutas"
+            )
+            print(f"⚠️  No encontrado: {filename}")
+
+if not files_to_attach:
+    print("⚠️  No hay archivos para adjuntar. Abortando envío.")
     exit(0)
 
-excel_path = files[0]
-excel_name = os.path.basename(excel_path)
-
-# ── Construir el email ──────────────────────────────────────────────────────
+# ── Construir email ──────────────────────────────────────────
 msg = MIMEMultipart()
 msg["From"]    = GMAIL_USER
 msg["To"]      = ", ".join(recipients)
-msg["Subject"] = f"📦 Rutas del día - Ametller Origen ({today_str})"
+msg["Subject"] = f"📦 Rutas de entrega - Ametller Origen ({today.strftime('%d/%m/%Y')})"
 
 body = f"""Hola,
 
-Adjunto encontraréis el Excel con las rutas de entrega del día {today_str}.
+Adjunto encontraréis los Excel con las rutas de entrega de hoy y mañana para ambas tiendas:
 
-El archivo incluye:
+{chr(10).join(summary_lines)}
+
+Cada archivo incluye:
   • Número de ruta
   • Número de pedido (job_number)
   • Posición en la ruta (stop)
@@ -53,19 +72,19 @@ Sistema de automatización - Ametller Origen
 
 msg.attach(MIMEText(body, "plain"))
 
-# ── Adjuntar el Excel ───────────────────────────────────────────────────────
-with open(excel_path, "rb") as f:
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(f.read())
+# ── Adjuntar Excel ───────────────────────────────────────────
+for filepath in files_to_attach:
+    with open(filepath, "rb") as f:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(f.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(filepath)}"')
+    msg.attach(part)
 
-encoders.encode_base64(part)
-part.add_header("Content-Disposition", f'attachment; filename="{excel_name}"')
-msg.attach(part)
-
-# ── Enviar via Gmail SMTP ───────────────────────────────────────────────────
+# ── Enviar ────────────────────────────────────────────────────
 print(f"📧 Enviando email a: {', '.join(recipients)}")
 with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
     server.login(GMAIL_USER, GMAIL_APP_PASS)
     server.sendmail(GMAIL_USER, recipients, msg.as_string())
 
-print("✅ Email enviado correctamente")
+print(f"✅ Email enviado con {len(files_to_attach)} adjunto(s)")
