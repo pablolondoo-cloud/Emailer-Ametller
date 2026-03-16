@@ -5,7 +5,6 @@ para capturar los headers exactos que usa el navegador.
 """
 
 import os
-import json
 import asyncio
 import requests
 from datetime import datetime, timezone, timedelta
@@ -41,50 +40,51 @@ async def get_auth_headers() -> dict:
         )
         page = await context.new_page()
 
-        # Interceptar requests a avt-backend para capturar los headers
+        # Interceptar requests a avt-backend para capturar los headers exactos
         async def intercept_request(request):
             if "avt-backend.instaleap.io" in request.url and not captured_headers:
-                hdrs = request.headers
-                # Guardar todos los headers relevantes
-                for key in ["authorization", "cookie", "x-session-token", "x-auth-token", "x-token"]:
-                    if key in hdrs:
-                        captured_headers[key] = hdrs[key]
-                        print(f"✅ Header capturado: {key} = {hdrs[key][:60]}...")
-                # Guardar también headers genéricos útiles
-                captured_headers["_all"] = dict(hdrs)
-                print(f"📋 Todos los headers de avt-backend capturados ({len(hdrs)} headers)")
+                hdrs = dict(request.headers)
+                captured_headers.update(hdrs)
+                captured_headers["_url"] = request.url
+                print(f"✅ Headers capturados de: {request.url[:80]}")
 
         page.on("request", intercept_request)
 
-        # Ir al portal
+        # Cargar portal
         await page.goto(PORTAL_URL, wait_until="networkidle", timeout=30000)
         print("📄 Portal cargado")
+        await page.wait_for_timeout(2000)
 
-        # Esperar campo email
-        await page.wait_for_selector('input[type="email"], input[name="email"]', timeout=15000)
-        await page.fill('input[type="email"], input[name="email"]', PORTAL_EMAIL)
+        # ── PASO 1: Email — campo id="email" type="text" ──
+        await page.wait_for_selector('#email', timeout=15000)
+        await page.fill('#email', PORTAL_EMAIL)
         print("✉️  Email introducido")
-        await page.keyboard.press("Enter")
 
-        # Esperar campo password
+        # Click en botón "Continue"
+        await page.click('button:has-text("Continue")')
+        print("▶️  Continue pulsado")
+
+        # ── PASO 2: Contraseña ──
         await page.wait_for_selector('input[type="password"]', timeout=15000)
         await page.fill('input[type="password"]', PORTAL_PASSWORD)
         print("🔑 Contraseña introducida")
-        await page.keyboard.press("Enter")
+
+        # Click en submit
+        await page.click('button[type="submit"], button:has-text("Log in"), button:has-text("Continue"), button:has-text("Sign in")')
+        print("▶️  Submit pulsado")
 
         # Esperar dashboard
         await page.wait_for_url("**/routes**", timeout=30000)
-        print("✅ Login exitoso")
+        print("✅ Login exitoso, dashboard cargado")
 
-        # Esperar a que se haga la llamada a nebula/routing automáticamente
-        # (el dashboard la hace al cargar)
+        # Esperar a que el dashboard haga la llamada a la API automáticamente
         await page.wait_for_timeout(5000)
 
-        # Si no se capturó todavía, navegar a la URL de rutas para forzar la llamada
+        # Si no se capturó, navegar a la URL de rutas para forzar la llamada
         if not captured_headers:
-            print("🔄 Navegando a rutas para forzar llamada a la API...")
-            madrid = timezone(timedelta(hours=1))
-            today  = datetime.now(madrid).date()
+            print("🔄 Navegando a rutas para forzar llamada API...")
+            madrid    = timezone(timedelta(hours=1))
+            today     = datetime.now(madrid).date()
             routes_url = (
                 f"{PORTAL_URL}/routes"
                 f"?storeId={STORE_ID}"
@@ -99,6 +99,7 @@ async def get_auth_headers() -> dict:
     if not captured_headers:
         raise Exception("❌ No se pudieron capturar los headers de autenticación")
 
+    print(f"✅ Headers capturados correctamente")
     return captured_headers
 
 
@@ -113,19 +114,18 @@ def get_routes(auth_headers: dict) -> list:
     from_str = from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     to_str   = to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.999Z")
 
-    # Usar los headers reales capturados del navegador
-    headers = auth_headers.get("_all", {})
-    # Asegurar headers mínimos necesarios
+    # Usar headers reales — eliminar pseudo-headers HTTP/2
+    headers = {k: v for k, v in auth_headers.items()
+               if not k.startswith(":") and k not in
+               ("content-length", "if-none-match", "_url")}
+
+    # Asegurar headers mínimos
     headers.update({
         "accept":       "application/json",
         "content-type": "application/json",
         "origin":       "https://control.instaleap.io",
         "referer":      "https://control.instaleap.io/",
     })
-    # Eliminar headers que pueden causar problemas en requests
-    for h in [":authority", ":method", ":path", ":scheme",
-              "content-length", "if-none-match"]:
-        headers.pop(h, None)
 
     all_routes = []
     limit  = 50
@@ -149,7 +149,8 @@ def get_routes(auth_headers: dict) -> list:
         r = requests.get(url, headers=headers, timeout=30)
 
         if r.status_code == 401:
-            print(f"❌ 401 Unauthorized. Headers enviados: {list(headers.keys())}")
+            print(f"❌ 401 Unauthorized.")
+            print(f"   Headers enviados: {list(headers.keys())}")
             print(f"   Response: {r.text[:300]}")
             raise Exception("Autenticación fallida - 401")
 
