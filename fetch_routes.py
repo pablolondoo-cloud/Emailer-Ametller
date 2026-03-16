@@ -1,12 +1,12 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
-Usa Playwright para hacer login y luego intercepta la llamada real a la API
-para capturar los headers exactos que usa el navegador.
+Hace login con Playwright y ejecuta la llamada a la API DESDE el propio
+navegador (via page.evaluate) para evitar problemas de autenticación.
 """
 
 import os
+import json
 import asyncio
-import requests
 from datetime import datetime, timezone, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -27,11 +27,10 @@ API_BASE   = "https://avt-backend.instaleap.io/nebula/routing"
 
 
 # ─────────────────────────────────────────────
-# 1. LOGIN + CAPTURAR HEADERS REALES de la API
+# 1. LOGIN + LLAMAR API DESDE EL NAVEGADOR
 # ─────────────────────────────────────────────
-async def get_auth_headers() -> dict:
+async def fetch_routes_from_browser() -> list:
     print("🔐 Iniciando login con Playwright...")
-    captured_headers = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -40,138 +39,111 @@ async def get_auth_headers() -> dict:
         )
         page = await context.new_page()
 
-        # Interceptar requests a avt-backend para capturar los headers exactos
-        async def intercept_request(request):
-            if "avt-backend.instaleap.io" in request.url and not captured_headers:
-                hdrs = dict(request.headers)
-                captured_headers.update(hdrs)
-                captured_headers["_url"] = request.url
-                print(f"✅ Headers capturados de: {request.url[:80]}")
-
-        page.on("request", intercept_request)
-
         # Cargar portal
         await page.goto(PORTAL_URL, wait_until="networkidle", timeout=30000)
         print("📄 Portal cargado")
         await page.wait_for_timeout(2000)
 
-        # ── PASO 1: Email — campo id="email" type="text" ──
+        # ── Email ──
         await page.wait_for_selector('#email', timeout=15000)
         await page.fill('#email', PORTAL_EMAIL)
         print("✉️  Email introducido")
-
-        # Click en botón "Continue"
         await page.click('button:has-text("Continue")')
         print("▶️  Continue pulsado")
 
-        # ── PASO 2: Contraseña ──
+        # ── Password ──
         await page.wait_for_selector('input[type="password"]', timeout=15000)
         await page.fill('input[type="password"]', PORTAL_PASSWORD)
         print("🔑 Contraseña introducida")
-
-        # Click en submit
         await page.click('button[type="submit"], button:has-text("Log in"), button:has-text("Continue"), button:has-text("Sign in")')
         print("▶️  Submit pulsado")
 
-        # Esperar dashboard
+        # ── Esperar dashboard ──
         await page.wait_for_url("**/routes**", timeout=30000)
-        print("✅ Login exitoso, dashboard cargado")
+        print("✅ Login exitoso")
+        await page.wait_for_timeout(4000)
 
-        # Esperar a que el dashboard haga la llamada a la API automáticamente
-        await page.wait_for_timeout(5000)
+        # ── Construir URL de la API para hoy ──
+        madrid   = timezone(timedelta(hours=1))
+        today    = datetime.now(madrid).date()
+        from_dt  = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=madrid)
+        to_dt    = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=madrid)
+        from_str = from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        to_str   = to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.999Z")
 
-        # Si no se capturó, navegar a la URL de rutas para forzar la llamada
-        if not captured_headers:
-            print("🔄 Navegando a rutas para forzar llamada API...")
-            madrid    = timezone(timedelta(hours=1))
-            today     = datetime.now(madrid).date()
-            routes_url = (
-                f"{PORTAL_URL}/routes"
-                f"?storeId={STORE_ID}"
-                f"&date={today}"
-                f"&status=CREATED,ON_BOARDING,PROCESSING"
-            )
-            await page.goto(routes_url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(5000)
-
-        await browser.close()
-
-    if not captured_headers:
-        raise Exception("❌ No se pudieron capturar los headers de autenticación")
-
-    print(f"✅ Headers capturados correctamente")
-    return captured_headers
-
-
-# ─────────────────────────────────────────────
-# 2. LLAMADA A LA API con los headers capturados
-# ─────────────────────────────────────────────
-def get_routes(auth_headers: dict) -> list:
-    madrid   = timezone(timedelta(hours=1))
-    today    = datetime.now(madrid).date()
-    from_dt  = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=madrid)
-    to_dt    = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=madrid)
-    from_str = from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    to_str   = to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.999Z")
-
-    # Usar headers reales — eliminar pseudo-headers HTTP/2
-    headers = {k: v for k, v in auth_headers.items()
-               if not k.startswith(":") and k not in
-               ("content-length", "if-none-match", "_url")}
-
-    # Asegurar headers mínimos
-    headers.update({
-        "accept":       "application/json",
-        "content-type": "application/json",
-        "origin":       "https://control.instaleap.io",
-        "referer":      "https://control.instaleap.io/",
-    })
-
-    all_routes = []
-    limit  = 50
-    offset = 0
-
-    while True:
-        params = (
-            f"store_id={STORE_ID}"
+        states_qs = "&".join([f"states[]={s}" for s in STATES])
+        api_url = (
+            f"{API_BASE}"
+            f"?store_id={STORE_ID}"
             f"&client_id={CLIENT_ID}"
-            f"&limit={limit}"
-            f"&offset={offset}"
+            f"&limit=100"
+            f"&offset=0"
             f"&from={from_str}"
             f"&to={to_str}"
+            f"&{states_qs}"
         )
-        for s in STATES:
-            params += f"&states[]={s}"
 
-        url = f"{API_BASE}?{params}"
-        print(f"📡 Obteniendo rutas offset={offset}...")
+        print(f"📡 Llamando API desde el navegador...")
+        print(f"   URL: {api_url[:100]}...")
 
-        r = requests.get(url, headers=headers, timeout=30)
+        # ── Ejecutar fetch() DESDE el navegador (mismas cookies/auth) ──
+        result = await page.evaluate(f"""
+            async () => {{
+                const response = await fetch("{api_url}", {{
+                    method: "GET",
+                    headers: {{
+                        "accept": "application/json",
+                        "content-type": "application/json"
+                    }},
+                    credentials: "include"
+                }});
+                const status = response.status;
+                const text = await response.text();
+                return {{ status, text }};
+            }}
+        """)
 
-        if r.status_code == 401:
-            print(f"❌ 401 Unauthorized.")
-            print(f"   Headers enviados: {list(headers.keys())}")
-            print(f"   Response: {r.text[:300]}")
-            raise Exception("Autenticación fallida - 401")
+        print(f"   Status: {result['status']}")
 
-        r.raise_for_status()
-        data = r.json()
+        if result['status'] != 200:
+            print(f"   Response: {result['text'][:300]}")
+            raise Exception(f"API devolvió {result['status']}: {result['text'][:200]}")
 
+        data = json.loads(result['text'])
         routes = data.get("routes", [])
-        all_routes.extend(routes)
+        total_pages = data.get("total_pages", 1)
+        print(f"✅ Página 1: {len(routes)} rutas (total_pages={total_pages})")
 
-        total_pages  = data.get("total_pages", 1)
-        current_page = (offset // limit) + 1
-        if current_page >= total_pages or not routes:
-            break
-        offset += limit
+        # Paginar si hay más páginas
+        all_routes = list(routes)
+        for page_num in range(1, total_pages):
+            offset = page_num * 100
+            api_url_page = api_url.replace("offset=0", f"offset={offset}")
+            result = await page.evaluate(f"""
+                async () => {{
+                    const response = await fetch("{api_url_page}", {{
+                        method: "GET",
+                        headers: {{
+                            "accept": "application/json",
+                            "content-type": "application/json"
+                        }},
+                        credentials: "include"
+                    }});
+                    return {{ status: response.status, text: await response.text() }};
+                }}
+            """)
+            if result['status'] == 200:
+                page_data = json.loads(result['text'])
+                all_routes.extend(page_data.get("routes", []))
+                print(f"✅ Página {page_num+1}: {len(page_data.get('routes',[]))} rutas")
 
-    print(f"✅ Total rutas: {len(all_routes)}")
-    return all_routes
+        await browser.close()
+        print(f"✅ Total rutas obtenidas: {len(all_routes)}")
+        return all_routes
 
 
 # ─────────────────────────────────────────────
-# 3. GENERAR EXCEL
+# 2. GENERAR EXCEL
 # ─────────────────────────────────────────────
 def parse_dt(s: str) -> str:
     dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
@@ -241,8 +213,7 @@ async def main():
     today_str = datetime.now(madrid).strftime("%Y-%m-%d")
     output    = f"rutas_{today_str}.xlsx"
 
-    auth_headers = await get_auth_headers()
-    routes       = get_routes(auth_headers)
+    routes = await fetch_routes_from_browser()
 
     if not routes:
         print("⚠️  No hay rutas para hoy. No se genera Excel.")
