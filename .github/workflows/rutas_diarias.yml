@@ -14,13 +14,16 @@ jobs:
       - name: 📥 Checkout repo
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Instalar dependencias
-        run: pip install requests openpyxl
+      - name: 📦 Instalar dependencias Python
+        run: pip install requests openpyxl playwright
+
+      - name: 🎭 Instalar navegador Playwright
+        run: playwright install chromium --with-deps
 
       - name: 🚀 Ejecutar RPA - Fetch rutas
         env:
