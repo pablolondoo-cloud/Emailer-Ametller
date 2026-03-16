@@ -1,7 +1,6 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
-Login con Playwright, navega a la URL exacta de rutas con store_id correcto
-e intercepta la respuesta de /nebula/routing.
+Genera 4 Excel: HOY y MAÑANA para cada tienda (El Prat + Garraf)
 """
 
 import os
@@ -20,19 +19,63 @@ PORTAL_EMAIL    = os.environ["PORTAL_EMAIL"]
 PORTAL_PASSWORD = os.environ["PORTAL_PASSWORD"]
 
 PORTAL_URL = "https://control.instaleap.io"
-STORE_ID   = "70fcffac-e7de-44ca-845b-f316fd5b874e"
 CLIENT_ID  = "AMETLLER_ORIGEN"
 STATES     = ["CREATED", "ON_BOARDING", "PROCESSING"]
-API_BASE   = "https://avt-backend.instaleap.io/nebula/routing"
+
+STORES = [
+    {"id": "70fcffac-e7de-44ca-845b-f316fd5b874e", "name": "ElPrat"},
+    {"id": "6258d460-6aad-40e2-9de8-6914d4ea7a96", "name": "Garraf"},
+]
 
 
 # ─────────────────────────────────────────────
-# 1. LOGIN + INTERCEPTAR RESPUESTA
+# 1. FETCH RUTAS PARA UNA TIENDA Y FECHA
 # ─────────────────────────────────────────────
-async def fetch_routes_from_browser() -> list:
-    print("🔐 Iniciando login con Playwright...")
-    all_routes = []
+async def fetch_routes_for_store_date(page, store_id: str, store_name: str, target_date) -> list:
+    all_routes     = []
     response_event = asyncio.Event()
+
+    async def handle_response(response):
+        if "nebula/routing" in response.url and response.status == 200:
+            try:
+                data   = await response.json()
+                routes = data.get("routes", [])
+                if routes:
+                    all_routes.extend(routes)
+                    print(f"    ✅ {len(routes)} rutas interceptadas")
+                    response_event.set()
+                else:
+                    print(f"    ℹ️  Respuesta vacía, ignorando...")
+            except Exception as e:
+                print(f"    ⚠️  Error parseando: {e}")
+
+    page.on("response", handle_response)
+
+    date_str   = target_date.strftime("%Y-%m-%d")
+    target_url = (
+        f"{PORTAL_URL}/routes"
+        f"?storeId={store_id}"
+        f"&date={date_str}"
+        f"&status=CREATED,ON_BOARDING,PROCESSING"
+    )
+    print(f"    🔄 [{store_name}] Navegando a rutas del {date_str}...")
+    await page.goto(target_url, wait_until="networkidle", timeout=30000)
+
+    try:
+        await asyncio.wait_for(response_event.wait(), timeout=20)
+    except asyncio.TimeoutError:
+        print(f"    ⚠️  Timeout — puede que no haya rutas para {store_name} {date_str}")
+
+    page.remove_listener("response", handle_response)
+    return all_routes
+
+
+# ─────────────────────────────────────────────
+# 2. LOGIN + FETCH TODAS LAS COMBINACIONES
+# ─────────────────────────────────────────────
+async def fetch_all_routes() -> list:
+    """Devuelve lista de dicts: {store_name, date, date_label, routes, filename}"""
+    print("🔐 Iniciando login con Playwright...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -41,84 +84,63 @@ async def fetch_routes_from_browser() -> list:
         )
         page = await context.new_page()
 
-        # ── Interceptar TODAS las respuestas de /nebula/routing ──
-        async def handle_response(response):
-            if "nebula/routing" in response.url and response.status == 200:
-                try:
-                    data   = await response.json()
-                    routes = data.get("routes", [])
-                    if routes:  # Solo guardar si tiene rutas reales
-                        all_routes.extend(routes)
-                        print(f"✅ Interceptada: {len(routes)} rutas de {response.url[:80]}")
-                        response_event.set()
-                    else:
-                        print(f"ℹ️  Respuesta vacía interceptada (store diferente), ignorando...")
-                except Exception as e:
-                    print(f"⚠️  Error parseando: {e}")
-
-        page.on("response", handle_response)
-
-        # ── Cargar portal ──
+        # ── Login ──
         await page.goto(PORTAL_URL, wait_until="networkidle", timeout=30000)
         print("📄 Portal cargado")
         await page.wait_for_timeout(2000)
 
-        # ── Email ──
         await page.wait_for_selector('#email', timeout=15000)
         await page.fill('#email', PORTAL_EMAIL)
         print("✉️  Email introducido")
         await page.click('button:has-text("Continue")')
 
-        # ── Password ──
         await page.wait_for_selector('input[type="password"]', timeout=15000)
         await page.fill('input[type="password"]', PORTAL_PASSWORD)
         print("🔑 Contraseña introducida")
         await page.click('button[type="submit"], button:has-text("Log in"), button:has-text("Continue"), button:has-text("Sign in")')
 
-        # ── Esperar dashboard ──
         await page.wait_for_url("**/routes**", timeout=30000)
-        print("✅ Login exitoso")
+        print("✅ Login exitoso\n")
         await page.wait_for_timeout(3000)
 
-        # ── Navegar a la URL exacta con el store_id y fecha correctos ──
-        madrid     = timezone(timedelta(hours=1))
-        today      = datetime.now(madrid).date()
-        today_str  = today.strftime("%Y-%m-%d")
+        # ── Fechas ──
+        madrid   = timezone(timedelta(hours=1))
+        today    = datetime.now(madrid).date()
+        tomorrow = today + timedelta(days=1)
 
-        target_url = (
-            f"{PORTAL_URL}/routes"
-            f"?storeId={STORE_ID}"
-            f"&date={today_str}"
-            f"&status=CREATED,ON_BOARDING,PROCESSING"
-        )
-        print(f"🔄 Navegando a: {target_url}")
-        await page.goto(target_url, wait_until="networkidle", timeout=30000)
-        print("📄 Página de rutas cargada")
+        results = []
 
-        # ── Esperar la respuesta interceptada (máx 20s) ──
-        try:
-            await asyncio.wait_for(response_event.wait(), timeout=20)
-            print(f"✅ Rutas capturadas correctamente")
-        except asyncio.TimeoutError:
-            # Si no llegó respuesta, esperar más y reintentar scroll
-            print("⏳ Esperando más tiempo...")
-            await page.wait_for_timeout(5000)
+        # ── Iterar tiendas × fechas ──
+        for store in STORES:
+            for date_obj, date_label in [(today, "HOY"), (tomorrow, "MAÑANA")]:
+                print(f"📅 [{store['name']}] {date_label} ({date_obj})...")
+                routes = await fetch_routes_for_store_date(
+                    page, store["id"], store["name"], date_obj
+                )
+                filename = f"rutas_{store['name']}_{date_obj.strftime('%Y-%m-%d')}.xlsx"
+                results.append({
+                    "store_name":  store["name"],
+                    "date":        date_obj,
+                    "date_label":  date_label,
+                    "routes":      routes,
+                    "filename":    filename,
+                })
+                await page.wait_for_timeout(1000)  # pequeña pausa entre navegaciones
 
         await browser.close()
 
-    print(f"✅ Total rutas: {len(all_routes)}")
-    return all_routes
+    return results
 
 
 # ─────────────────────────────────────────────
-# 2. GENERAR EXCEL
+# 3. GENERAR EXCEL
 # ─────────────────────────────────────────────
 def parse_dt(s: str) -> str:
     dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone(timedelta(hours=1))).strftime("%d/%m/%Y %H:%M")
 
 
-def generate_excel(routes: list, output_path: str):
+def generate_excel(routes: list, output_path: str, store_name: str, date_label: str):
     wb = Workbook()
     ws = wb.active
     ws.title = "Routes"
@@ -170,24 +192,32 @@ def generate_excel(routes: list, output_path: str):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:E{row - 1}"
     wb.save(output_path)
-    print(f"✅ Excel generado: {output_path} ({row - 2} filas)")
+    print(f"  ✅ Excel generado: {output_path} ({row - 2} filas)")
 
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 async def main():
-    madrid    = timezone(timedelta(hours=1))
-    today_str = datetime.now(madrid).strftime("%Y-%m-%d")
-    output    = f"rutas_{today_str}.xlsx"
+    results = await fetch_all_routes()
 
-    routes = await fetch_routes_from_browser()
+    generated = []
+    for entry in results:
+        if entry["routes"]:
+            generate_excel(
+                entry["routes"],
+                entry["filename"],
+                entry["store_name"],
+                entry["date_label"],
+            )
+            generated.append(entry["filename"])
+        else:
+            print(f"⚠️  Sin rutas para {entry['store_name']} {entry['date_label']} — no se genera Excel.")
 
-    if not routes:
-        print("⚠️  No hay rutas para hoy. No se genera Excel.")
+    if generated:
+        print(f"\n📊 Archivos generados: {generated}")
     else:
-        generate_excel(routes, output)
-        print(f"📊 Archivo listo: {output}")
+        print("\n⚠️  No se generó ningún Excel.")
 
 
 if __name__ == "__main__":
