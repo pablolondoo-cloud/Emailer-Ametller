@@ -1,0 +1,43 @@
+name: 📦 Rutas Diarias - Ametller Origen
+
+on:
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+
+jobs:
+  generar-excel-rutas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Instalar dependencias
+        run: pip install requests openpyxl
+
+      - name: 🚀 Ejecutar RPA - Fetch rutas
+        env:
+          PORTAL_EMAIL:    ${{ secrets.PORTAL_EMAIL }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+        run: python fetch_routes.py
+
+      - name: 💾 Guardar Excel como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: rutas-${{ github.run_id }}
+          path: rutas_*.xlsx
+          retention-days: 7
+
+      - name: 📧 Enviar email con Excel
+        env:
+          GMAIL_USER:     ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+        run: python send_email.py
