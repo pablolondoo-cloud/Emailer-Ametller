@@ -1,0 +1,38 @@
+name: 🔍 Debug Scroll
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Instalar dependencias
+        run: pip install playwright
+
+      - name: 🎭 Instalar Chromium
+        run: playwright install chromium --with-deps
+
+      - name: 🔍 Ejecutar debug scroll
+        env:
+          PORTAL_EMAIL:    ${{ secrets.PORTAL_EMAIL }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+        run: python debug_scroll.py
+
+      - name: 📸 Guardar artefactos
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-scroll-${{ github.run_id }}
+          path: |
+            scroll_*.png
+          retention-days: 1
