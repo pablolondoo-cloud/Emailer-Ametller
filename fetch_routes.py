@@ -1,7 +1,7 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
 - Stop empieza en 0
-- Captura TODAS las páginas de rutas (paginación completa)
+- Paginación completa via intercepción de todas las páginas de la API
 - 2 tiendas x 2 días = hasta 4 Excel
 """
 
@@ -23,6 +23,7 @@ PORTAL_PASSWORD = os.environ["PORTAL_PASSWORD"]
 PORTAL_URL = "https://control.instaleap.io"
 CLIENT_ID  = "AMETLLER_ORIGEN"
 STATES     = ["CREATED", "ON_BOARDING", "PROCESSING"]
+PAGE_LIMIT = 10  # El portal usa limit=10 por defecto
 
 STORES = [
     {"id": "70fcffac-e7de-44ca-845b-f316fd5b874e", "name": "ElPrat"},
@@ -34,77 +35,125 @@ STORES = [
 # 1. FETCH TODAS LAS PÁGINAS DE UNA TIENDA/FECHA
 # ─────────────────────────────────────────────
 async def fetch_routes_for_store_date(page, store_id: str, store_name: str, target_date) -> list:
-    """
-    Intercepta TODAS las respuestas paginadas de /nebula/routing para
-    esta tienda y fecha. Navega a la página y luego hace scroll para
-    triggear las páginas adicionales.
-    """
-    all_routes    = []
-    pages_seen    = set()
-    last_response = asyncio.Event()
+    all_routes  = []
+    total_pages = 1
+    pages_data  = {}  # offset -> routes
 
+    # ── Interceptor: captura TODAS las respuestas de /nebula/routing ──
     async def handle_response(response):
+        nonlocal total_pages
         if "nebula/routing" in response.url and response.status == 200:
             try:
-                data        = await response.json()
-                routes      = data.get("routes", [])
-                total_pages = data.get("total_pages", 1)
-                offset      = 0
+                data   = await response.json()
+                routes = data.get("routes", [])
+                tp     = data.get("total_pages", 1)
+                total_pages = max(total_pages, tp)
+
                 # Extraer offset de la URL
+                offset = 0
                 if "offset=" in response.url:
                     try:
                         offset = int(response.url.split("offset=")[1].split("&")[0])
                     except:
                         pass
 
-                if offset not in pages_seen:
-                    pages_seen.add(offset)
-                    all_routes.extend(routes)
-                    print(f"    ✅ Página offset={offset}: {len(routes)} rutas (total_pages={total_pages})")
-                    last_response.set()
-                    last_response.clear()
+                if offset not in pages_data:
+                    pages_data[offset] = routes
+                    print(f"    📥 [{store_name}] offset={offset}: {len(routes)} rutas (total_pages={tp})")
 
             except Exception as e:
                 print(f"    ⚠️  Error parseando: {e}")
 
     page.on("response", handle_response)
 
+    # ── Construir URL base de la API ──
+    madrid   = timezone(timedelta(hours=1))
+    from_dt  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0,
+                        tzinfo=madrid)
+    to_dt    = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59,
+                        tzinfo=madrid)
+    from_str = from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    to_str   = to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.999Z")
+
+    states_qs = "".join([f"&states[]={s}" for s in STATES])
+    api_base  = (
+        f"https://avt-backend.instaleap.io/nebula/routing"
+        f"?store_id={store_id}"
+        f"&client_id={CLIENT_ID}"
+        f"&limit={PAGE_LIMIT}"
+        f"&from={from_str}"
+        f"&to={to_str}"
+        f"{states_qs}"
+    )
+
     date_str   = target_date.strftime("%Y-%m-%d")
-    target_url = (
+    portal_url = (
         f"{PORTAL_URL}/routes"
         f"?storeId={store_id}"
         f"&date={date_str}"
         f"&status=CREATED,ON_BOARDING,PROCESSING"
     )
-    print(f"    🔄 [{store_name}] Navegando a rutas del {date_str}...")
-    await page.goto(target_url, wait_until="networkidle", timeout=30000)
+
+    # ── Cargar la página del portal (esto triggerea offset=0) ──
+    print(f"    🔄 [{store_name}] Navegando a {date_str}...")
+    await page.goto(portal_url, wait_until="networkidle", timeout=30000)
     await page.wait_for_timeout(3000)
 
-    # ── Scroll para cargar páginas adicionales ──
-    print(f"    📜 Haciendo scroll para cargar todas las páginas...")
-    prev_route_count = 0
-    max_scrolls      = 20
-
-    for i in range(max_scrolls):
-        # Scroll al final de la página
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(2000)
-
-        # También intentar scroll dentro del contenedor de rutas
-        await page.evaluate("""
-            const containers = document.querySelectorAll('[class*="list"], [class*="route"], [class*="scroll"]');
-            containers.forEach(c => c.scrollTop = c.scrollHeight);
-        """)
-        await page.wait_for_timeout(1500)
-
-        if len(all_routes) == prev_route_count:
-            # No llegaron rutas nuevas en este scroll
+    # ── Esperar a tener la página 0 ──
+    for _ in range(10):
+        if 0 in pages_data:
             break
-        prev_route_count = len(all_routes)
-        print(f"    📜 Scroll {i+1}: {len(all_routes)} rutas acumuladas...")
+        await page.wait_for_timeout(1000)
+
+    if 0 not in pages_data:
+        print(f"    ⚠️  No se recibió página 0 para {store_name} {date_str}")
+        page.remove_listener("response", handle_response)
+        return []
+
+    # ── Pedir páginas adicionales directamente desde el navegador ──
+    for page_num in range(1, total_pages):
+        offset   = page_num * PAGE_LIMIT
+        api_url  = f"{api_base}&offset={offset}"
+
+        print(f"    📡 Pidiendo página {page_num+1}/{total_pages} (offset={offset})...")
+
+        # Usar fetch() desde dentro del navegador (misma sesión/cookies)
+        result = await page.evaluate(f"""
+            async () => {{
+                try {{
+                    const r = await fetch("{api_url}", {{
+                        method: "GET",
+                        headers: {{ "accept": "application/json", "content-type": "application/json" }},
+                        credentials: "include"
+                    }});
+                    return {{ status: r.status, text: await r.text() }};
+                }} catch(e) {{
+                    return {{ status: 0, text: e.toString() }};
+                }}
+            }}
+        """)
+
+        if result["status"] == 200:
+            try:
+                data   = json.loads(result["text"])
+                routes = data.get("routes", [])
+                if offset not in pages_data:
+                    pages_data[offset] = routes
+                    print(f"    📥 Página {page_num+1}: {len(routes)} rutas adicionales")
+            except Exception as e:
+                print(f"    ⚠️  Error parseando página {page_num+1}: {e}")
+        else:
+            print(f"    ⚠️  Error página {page_num+1}: status={result['status']} {result['text'][:100]}")
+
+        await page.wait_for_timeout(500)
 
     page.remove_listener("response", handle_response)
-    print(f"    ✅ Total [{store_name}] {date_str}: {len(all_routes)} rutas en {len(pages_seen)} página(s)")
+
+    # ── Combinar todas las páginas en orden ──
+    for offset in sorted(pages_data.keys()):
+        all_routes.extend(pages_data[offset])
+
+    print(f"    ✅ Total [{store_name}] {date_str}: {len(all_routes)} rutas")
     return all_routes
 
 
@@ -206,8 +255,7 @@ def generate_excel(routes: list, output_path: str, store_name: str, date_label: 
     row = 2
     for route in routes:
         route_num = route.get("route_number", "")
-        # ✅ Stop empieza en 0
-        for stop_idx, task in enumerate(route.get("tasks", []), 0):
+        for stop_idx, task in enumerate(route.get("tasks", []), 0):  # ✅ empieza en 0
             fill = fill_light if row % 2 == 0 else fill_white
             values = [
                 route_num,
