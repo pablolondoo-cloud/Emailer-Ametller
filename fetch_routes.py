@@ -1,6 +1,8 @@
 """
 RPA - Ametller Origen: Extracción de rutas diarias → Excel
-Genera 4 Excel: HOY y MAÑANA para cada tienda (El Prat + Garraf)
+- Stop empieza en 0
+- Captura TODAS las páginas de rutas (paginación completa)
+- 2 tiendas x 2 días = hasta 4 Excel
 """
 
 import os
@@ -29,23 +31,39 @@ STORES = [
 
 
 # ─────────────────────────────────────────────
-# 1. FETCH RUTAS PARA UNA TIENDA Y FECHA
+# 1. FETCH TODAS LAS PÁGINAS DE UNA TIENDA/FECHA
 # ─────────────────────────────────────────────
 async def fetch_routes_for_store_date(page, store_id: str, store_name: str, target_date) -> list:
-    all_routes     = []
-    response_event = asyncio.Event()
+    """
+    Intercepta TODAS las respuestas paginadas de /nebula/routing para
+    esta tienda y fecha. Navega a la página y luego hace scroll para
+    triggear las páginas adicionales.
+    """
+    all_routes    = []
+    pages_seen    = set()
+    last_response = asyncio.Event()
 
     async def handle_response(response):
         if "nebula/routing" in response.url and response.status == 200:
             try:
-                data   = await response.json()
-                routes = data.get("routes", [])
-                if routes:
+                data        = await response.json()
+                routes      = data.get("routes", [])
+                total_pages = data.get("total_pages", 1)
+                offset      = 0
+                # Extraer offset de la URL
+                if "offset=" in response.url:
+                    try:
+                        offset = int(response.url.split("offset=")[1].split("&")[0])
+                    except:
+                        pass
+
+                if offset not in pages_seen:
+                    pages_seen.add(offset)
                     all_routes.extend(routes)
-                    print(f"    ✅ {len(routes)} rutas interceptadas")
-                    response_event.set()
-                else:
-                    print(f"    ℹ️  Respuesta vacía, ignorando...")
+                    print(f"    ✅ Página offset={offset}: {len(routes)} rutas (total_pages={total_pages})")
+                    last_response.set()
+                    last_response.clear()
+
             except Exception as e:
                 print(f"    ⚠️  Error parseando: {e}")
 
@@ -60,13 +78,33 @@ async def fetch_routes_for_store_date(page, store_id: str, store_name: str, targ
     )
     print(f"    🔄 [{store_name}] Navegando a rutas del {date_str}...")
     await page.goto(target_url, wait_until="networkidle", timeout=30000)
+    await page.wait_for_timeout(3000)
 
-    try:
-        await asyncio.wait_for(response_event.wait(), timeout=20)
-    except asyncio.TimeoutError:
-        print(f"    ⚠️  Timeout — puede que no haya rutas para {store_name} {date_str}")
+    # ── Scroll para cargar páginas adicionales ──
+    print(f"    📜 Haciendo scroll para cargar todas las páginas...")
+    prev_route_count = 0
+    max_scrolls      = 20
+
+    for i in range(max_scrolls):
+        # Scroll al final de la página
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(2000)
+
+        # También intentar scroll dentro del contenedor de rutas
+        await page.evaluate("""
+            const containers = document.querySelectorAll('[class*="list"], [class*="route"], [class*="scroll"]');
+            containers.forEach(c => c.scrollTop = c.scrollHeight);
+        """)
+        await page.wait_for_timeout(1500)
+
+        if len(all_routes) == prev_route_count:
+            # No llegaron rutas nuevas en este scroll
+            break
+        prev_route_count = len(all_routes)
+        print(f"    📜 Scroll {i+1}: {len(all_routes)} rutas acumuladas...")
 
     page.remove_listener("response", handle_response)
+    print(f"    ✅ Total [{store_name}] {date_str}: {len(all_routes)} rutas en {len(pages_seen)} página(s)")
     return all_routes
 
 
@@ -74,13 +112,13 @@ async def fetch_routes_for_store_date(page, store_id: str, store_name: str, targ
 # 2. LOGIN + FETCH TODAS LAS COMBINACIONES
 # ─────────────────────────────────────────────
 async def fetch_all_routes() -> list:
-    """Devuelve lista de dicts: {store_name, date, date_label, routes, filename}"""
     print("🔐 Iniciando login con Playwright...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900}
         )
         page = await context.new_page()
 
@@ -110,22 +148,21 @@ async def fetch_all_routes() -> list:
 
         results = []
 
-        # ── Iterar tiendas × fechas ──
         for store in STORES:
             for date_obj, date_label in [(today, "HOY"), (tomorrow, "MAÑANA")]:
-                print(f"📅 [{store['name']}] {date_label} ({date_obj})...")
+                print(f"\n📅 [{store['name']}] {date_label} ({date_obj})...")
                 routes = await fetch_routes_for_store_date(
                     page, store["id"], store["name"], date_obj
                 )
                 filename = f"rutas_{store['name']}_{date_obj.strftime('%Y-%m-%d')}.xlsx"
                 results.append({
-                    "store_name":  store["name"],
-                    "date":        date_obj,
-                    "date_label":  date_label,
-                    "routes":      routes,
-                    "filename":    filename,
+                    "store_name": store["name"],
+                    "date":       date_obj,
+                    "date_label": date_label,
+                    "routes":     routes,
+                    "filename":   filename,
                 })
-                await page.wait_for_timeout(1000)  # pequeña pausa entre navegaciones
+                await page.wait_for_timeout(1000)
 
         await browser.close()
 
@@ -133,7 +170,7 @@ async def fetch_all_routes() -> list:
 
 
 # ─────────────────────────────────────────────
-# 3. GENERAR EXCEL
+# 3. GENERAR EXCEL (Stop empieza en 0)
 # ─────────────────────────────────────────────
 def parse_dt(s: str) -> str:
     dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
@@ -169,7 +206,8 @@ def generate_excel(routes: list, output_path: str, store_name: str, date_label: 
     row = 2
     for route in routes:
         route_num = route.get("route_number", "")
-        for stop_idx, task in enumerate(route.get("tasks", []), 1):
+        # ✅ Stop empieza en 0
+        for stop_idx, task in enumerate(route.get("tasks", []), 0):
             fill = fill_light if row % 2 == 0 else fill_white
             values = [
                 route_num,
@@ -199,9 +237,9 @@ def generate_excel(routes: list, output_path: str, store_name: str, date_label: 
 # MAIN
 # ─────────────────────────────────────────────
 async def main():
-    results = await fetch_all_routes()
-
+    results   = await fetch_all_routes()
     generated = []
+
     for entry in results:
         if entry["routes"]:
             generate_excel(
