@@ -186,7 +186,7 @@ async def fetch_all_routes() -> list:
         results = []
 
         for store in STORES:
-            for date_obj, date_label in [(today, "HOY"), (tomorrow, "MAÑANA")]:
+            for date_obj, date_label in [(tomorrow, "MAÑANA")]:
                 print(f"\n📅 [{store['name']}] {date_label} ({date_obj})...")
                 routes = await fetch_routes_for_store_date(
                     page, store["id"], store["name"], date_obj
