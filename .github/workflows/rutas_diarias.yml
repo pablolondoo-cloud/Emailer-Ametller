@@ -2,7 +2,7 @@ name: 📦 Rutas Diarias - Ametller Origen
 
 on:
   schedule:
-    - cron: '0 19 * * *'
+    - cron: '0 16 * * *'
   workflow_dispatch:
 
 jobs:
